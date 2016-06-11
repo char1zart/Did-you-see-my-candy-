@@ -1,0 +1,438 @@
+// Fill out your copyright notice in the Description page of Project Settings.
+
+#include "testpickupnew.h"
+#include "EnemyAIController.h"
+#include "Enemy_Bot.h"
+#include "MainCharacter.h"
+#include "ProjectilePistol.h"
+#include "ProjectileRifle.h"
+#include "Engine.h"
+
+AEnemyAIController::AEnemyAIController(const FObjectInitializer& ObjectInitializer)
+: Super(ObjectInitializer)
+{
+	BlackboardComp = ObjectInitializer.CreateDefaultSubobject<UBlackboardComponent>(this, TEXT("BlackBoardComp"));
+	BehaviorComp = ObjectInitializer.CreateDefaultSubobject<UBehaviorTreeComponent>(this, TEXT("BehaviorComp"));
+
+	this->Target = NULL;
+	this->bIsTargetInLineOfSight = false;
+	this->FieldOfView = 150.0f; 
+	this->TargetLocation = FVector::ZeroVector;
+	
+
+}
+
+
+void AEnemyAIController::BeginPlay()
+{
+	Super::BeginPlay();
+
+	APawn* ControlledPawn = this->GetPawn();
+	if (ControlledPawn != NULL)
+	{
+		this->Bot = Cast<AEnemy_Bot>(ControlledPawn);
+
+		if (this->Bot != NULL)
+		{
+			this->Bot->AggroTrigger->OnComponentBeginOverlap.AddDynamic(this, &AEnemyAIController::OnAggroTriggerBeginOverlap);
+			this->Bot->AggroTrigger->OnComponentEndOverlap.AddDynamic(this, &AEnemyAIController::OnAggroTriggerEndOverlap);
+
+			this->Bot->AggroTriggerMelee->OnComponentBeginOverlap.AddDynamic(this, &AEnemyAIController::OnAggroTriggerMeleeBeginOverlap);
+			this->Bot->AggroTriggerMelee->OnComponentEndOverlap.AddDynamic(this, &AEnemyAIController::OnAggroTriggerMeleeEndOverlap);
+		}
+	}
+}
+
+
+
+bool AEnemyAIController::IsTargetInRange(AActor* Target, float AcceptanceRadius) const
+{
+	float DistanceToTarget = (Target->GetActorLocation() - this->Bot->GetActorLocation()).Size();
+	
+	bool bIsCloseEnough = (DistanceToTarget <= AcceptanceRadius);
+
+	return bIsCloseEnough;
+}
+
+
+void AEnemyAIController::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+	
+	if (this->Bot == NULL || !this->Bot->bIsDead)
+	{
+		return;
+	}
+
+	if (this->Target != NULL)
+	{
+		float AggroTriggerRadius = this->Bot->AggroTrigger->GetUnscaledSphereRadius();
+		float ShootAcceptanceRadius = AggroTriggerRadius * 0.75f;
+	    this->bIsTargetInRange = this->IsTargetInRange(this->Target, ShootAcceptanceRadius);
+		this->bIsTargetInLineOfSight = this->IsTargetInLineOfSight(this->Target);
+
+		GEngine->AddOnScreenDebugMessage(24, 2.0f, FColor::Cyan, FString::Printf(TEXT("IsTargetInLineOfSight: %d"), bIsTargetInLineOfSight));
+
+		if (this->bIsTargetInLineOfSight)
+		{
+			this->TargetLocation = this->Target->GetActorLocation();
+		}
+
+		GEngine->AddOnScreenDebugMessage(22, 2.0f, FColor::Red, FString(TEXT("TargetLocation")) + this->TargetLocation.ToString());
+
+
+		if (this->bIsUnawareHit)
+		{
+			float DistanceToSearchPoint = (this->Bot->GetActorLocation() - this->UnawareHitSearchLocation).Size();
+			if (DistanceToSearchPoint < 150.0f)
+			{
+				this->bIsUnawareHit = false;
+			}
+		}			
+	}
+
+}
+
+
+bool AEnemyAIController::ChaseTarget(AMainCharacter* Target, float AcceptanceRadius)
+{
+	bool bIsChasingTarget = false;
+
+	if (this->bIsTargetInLineOfSight && !Target->bIsDead)
+	{
+		bIsChasingTarget = true;
+		
+		this->MoveToLocation(this->TargetLocation, AcceptanceRadius);
+	}
+
+
+	else if (!this->Bot->bIsDead && !Target->bIsDead)
+	{
+		bIsChasingTarget = true;
+
+		GEngine->AddOnScreenDebugMessage(25, 2.0f, FColor::Blue, FString::Printf(TEXT("AcceptanceRadius: %.2f"), AcceptanceRadius));
+
+		EPathFollowingRequestResult::Type PathRequestResult = this->MoveToLocation(this->TargetLocation, AcceptanceRadius);
+
+		if (PathRequestResult == EPathFollowingRequestResult::AlreadyAtGoal)
+		{	
+				bIsChasingTarget = false;
+		}
+	}
+
+	return bIsChasingTarget;
+}
+
+void AEnemyAIController::Possess(class APawn* InPawn)
+{
+	Super::Possess(InPawn);
+
+	AEnemy_Bot* Bot = Cast<AEnemy_Bot>(InPawn);
+	
+	if (Bot && Bot->BotBehavior)
+	{	
+		BlackboardComp->InitializeBlackboard(*(Bot->BotBehavior)->BlackboardAsset);
+	
+		EnemyKeyID = BlackboardComp->GetKeyID("Enemy");
+		EnemyLocationID = BlackboardComp->GetKeyID("Destination");
+		CanAttackID = BlackboardComp->GetKeyID("CanAttack");
+		CanFindID = BlackboardComp->GetKeyID("CanFind");
+	
+		BehaviorComp->StartTree(*(Bot->BotBehavior));
+	}
+	
+}
+
+void AEnemyAIController::SearchForEnemy()
+{
+	if (Target != NULL)
+	{
+//	Bot->AggroTrigger->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+//Bot->AggroTriggerMelee->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+		APawn* MyBot = GetPawn();
+
+		if (MyBot == NULL)
+		{
+			return;
+		}
+
+		const FVector MyLoc = MyBot->GetActorLocation();
+		float BestDistSq = MAX_FLT;
+
+		AMainCharacter* BestPawn = NULL;
+
+		for (FConstPawnIterator It = GetWorld()->GetPawnIterator(); It; ++It)
+		{
+			AMainCharacter* TestPawn = Cast<AMainCharacter>(*It);
+
+			if (TestPawn)
+			{
+				const float DistSq = FVector::Dist(TestPawn->GetActorLocation(), MyLoc);
+				if (DistSq < BestDistSq)
+				{
+					BestDistSq = DistSq;
+					BestPawn = TestPawn;
+				}
+			}
+		}
+
+		if (BestPawn)
+		{
+			SetEnemy(BestPawn);
+		}
+
+	}
+	else
+	{
+		Bot->AggroTrigger->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+		Bot->AggroTriggerMelee->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+	}
+}
+
+void AEnemyAIController::SetEnemy(class APawn* InPawn)
+{		
+	BlackboardComp->SetValue<UBlackboardKeyType_Object>(EnemyKeyID, InPawn);
+	BlackboardComp->SetValue<UBlackboardKeyType_Vector>(EnemyLocationID, InPawn->GetActorLocation());
+	BlackboardComp->SetValue<UBlackboardKeyType_Bool>(CanAttackID, Bot->bIsCanAttack);
+	BlackboardComp->SetValue<UBlackboardKeyType_Bool>(CanFindID, Bot->bIsCanFind);
+}
+
+
+
+void AEnemyAIController::RespondToUnawareHitRifle(const FHitResult& Hit, const AActor* DamageCauser)
+{
+	this->bIsUnawareHit = true;
+
+
+	if (this->bIsTargetInLineOfSight)
+	{
+		// The enemy is aware of the target's location, so the hit is not unaware
+		this->bIsUnawareHit = false;
+		return;
+	}
+
+
+	AMainCharacter* MC = Cast<AMainCharacter>(this);
+
+	const AProjectileRifle* Projectile = Cast<AProjectileRifle>(DamageCauser);
+
+	if (Projectile != NULL)
+	{
+		UWorld* World = this->GetWorld();
+		if (World != NULL)
+		{
+
+			// We need to cast a ray from the projectile's spawn location straight down
+			// to get a location on the ground and tell the enemy character to go there.
+			// This is because the projectile is fired from above the ground, and the enemy can't go in the air
+			const FVector RayStart = Projectile->GetSpawnLocation();
+			const FVector RayEnd = RayStart + (FVector::UpVector * -1500.0f);
+			FCollisionQueryParams QueryParams(FName(TEXT("SurfaceTrace")), true, this);
+			FHitResult HitResult;
+
+			if (World->LineTraceSingle(HitResult, RayStart, RayEnd, ECollisionChannel::ECC_Visibility, QueryParams))
+			{
+				this->MoveToLocation(HitResult.Location);
+
+				this->UnawareHitSearchLocation = HitResult.Location;
+				SearchForEnemy();
+			}
+		}
+	}
+}
+
+
+void AEnemyAIController::RespondToUnawareHitPistol(const FHitResult& Hit, const AActor* DamageCauser)
+{
+	this->bIsUnawareHit = true;
+       
+	
+	if (this->bIsTargetInLineOfSight)
+	{
+		// The enemy is aware of the target's location, so the hit is not unaware
+		this->bIsUnawareHit = false;
+		return;
+	}
+
+
+	AMainCharacter* MC = Cast<AMainCharacter>(this);		
+
+	const AProjectilePistol* Projectile = Cast<AProjectilePistol>(DamageCauser);
+
+	if (Projectile != NULL)
+	{
+		UWorld* World = this->GetWorld();
+		if (World != NULL)
+		{
+			
+			// We need to cast a ray from the projectile's spawn location straight down
+			// to get a location on the ground and tell the enemy character to go there.
+			// This is because the projectile is fired from above the ground, and the enemy can't go in the air
+			const FVector RayStart = Projectile->GetSpawnLocation();
+			const FVector RayEnd = RayStart + (FVector::UpVector * -1500.0f);
+			FCollisionQueryParams QueryParams(FName(TEXT("SurfaceTrace")), true, this);
+			FHitResult HitResult;
+
+			if (World->LineTraceSingle(HitResult, RayStart, RayEnd, ECollisionChannel::ECC_Visibility, QueryParams))
+			{				
+				this->MoveToLocation(HitResult.Location);
+
+				this->UnawareHitSearchLocation = HitResult.Location;
+				SearchForEnemy();
+			}
+		}
+	}
+}
+
+
+void AEnemyAIController::SearchForEnemyIfRadius1m()
+{
+	if (Target != NULL)
+	{	
+		if (Bot->bIsCanAttack && (Target->bIsCrouchButtonDwn || !Target->bIsCrouchButtonDwn))
+		{
+			SearchForEnemy();
+		}
+	}
+	
+}
+
+
+void AEnemyAIController::SearchForEnemyIfRadius10m()
+{
+	if (this->Target != NULL)
+	{
+		if (!this->Target->bIsCrouchButtonDwn)
+		{
+			SearchForEnemy();
+		}
+	}
+}
+
+void AEnemyAIController::SearchForEnemyIfFlashlightOn()
+{
+	if (this->Target != NULL)
+	{
+		if (this->Target->bIsTurnOnLight)
+		{
+			SearchForEnemy();
+		}	
+	}
+}
+
+
+void AEnemyAIController::SearchForEnemyIfFiring()
+{
+	if (this->Target != NULL)
+	{		
+			if (this->Target->bIsFiring)
+			{
+				SearchForEnemy();
+			}
+	}
+}
+
+
+class AMainCharacter* AEnemyAIController::GetEnemy() const
+{
+	if (BlackboardComp)
+	{	
+		return Cast<AMainCharacter>(BlackboardComp->GetValue<UBlackboardKeyType_Object>(EnemyKeyID));
+	}
+
+	return NULL;
+}
+
+
+bool AEnemyAIController::IsTargetInLineOfSight(AActor* Target) const
+{
+	bool bIsInLineOfSight = false;
+
+	if (Target != NULL)
+	{
+		UWorld* World = this->GetWorld();
+		if (World != NULL)
+		{
+			// Make a raycast to the Target to see if the it is visible
+			const FVector RayStart = this->Bot->GetActorLocation() + FVector(0.0f, 0.0f, this->Bot->BaseEyeHeight);
+			const FVector RayEnd = Target->GetActorLocation();
+			FCollisionQueryParams QueryParams(FName(TEXT("TargetVisibility")), false, this);
+			QueryParams.AddIgnoredActor(this->Bot);
+			FHitResult HitResult;
+
+			if (World->LineTraceSingle(HitResult, RayStart, RayEnd, ECollisionChannel::ECC_Camera, QueryParams))
+			{
+				if (HitResult.Actor == Target)
+				{
+					// The target is visible, but we need to check if the target is in the line of sight of the enemy character
+					FVector EnemyForwardVector = this->Bot->GetActorForwardVector();
+					FVector DirectionToTarget = Target->GetActorLocation() - this->Bot->GetActorLocation();
+
+					EnemyForwardVector.Normalize();
+					DirectionToTarget.Normalize();
+
+					float AngleBetween = FMath::Acos(FVector::DotProduct(EnemyForwardVector, DirectionToTarget));
+					AngleBetween = FMath::RadiansToDegrees(AngleBetween);
+
+					if (AngleBetween <= this->FieldOfView * 0.5f)
+					{
+						bIsInLineOfSight = true;
+					}
+				}
+			}
+		}
+	}
+
+	return bIsInLineOfSight;
+}
+
+
+void AEnemyAIController::OnAggroTriggerBeginOverlap(class AActor* OtherActor, class UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
+{
+	AMainCharacter* MainCharacter = Cast<AMainCharacter>(OtherActor);
+	if (MainCharacter != NULL)
+	{
+		this->Target = MainCharacter;
+		GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Red, "Target MainCharacter");
+		Bot->bIsCanFind = true;
+	}
+	
+}
+
+void AEnemyAIController::OnAggroTriggerEndOverlap(class AActor* OtherActor, class UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
+{
+	AMainCharacter* MainCharacter = Cast<AMainCharacter>(OtherActor);
+	if (MainCharacter != NULL)
+	{
+		this->Target = NULL;
+		GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Red, "Target NON");
+	}
+}
+
+void AEnemyAIController::OnAggroTriggerMeleeBeginOverlap(class AActor* OtherActor, class UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
+{
+	AMainCharacter* MainCharacter = Cast<AMainCharacter>(OtherActor);
+
+	if (MainCharacter != NULL)
+	{
+		this->Target = MainCharacter;	
+		GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Red, "Can Attack");
+		
+		Bot->bIsCanAttack = true;			
+	}
+}
+
+
+void AEnemyAIController::OnAggroTriggerMeleeEndOverlap(class AActor* OtherActor, class UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
+{
+	AMainCharacter* MainCharacter = Cast<AMainCharacter>(OtherActor);
+	if (MainCharacter != NULL)
+	{
+		this->Target = NULL;
+		GEngine->AddOnScreenDebugMessage(-1, 2.f, FColor::Red, "Cant Attack");
+		Bot->bIsCanAttack = false;
+	}
+}
+
+
